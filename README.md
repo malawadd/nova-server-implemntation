@@ -31,10 +31,17 @@ MARA maintains the "emotional state" of the session. It tracks:
 ### WebSocket Events (`Socket.IO`)
 | Event | Direction | Description |
 | :--- | :--- | :--- |
-| `initializeConnection` | Client → Server | Sets up Bedrock stream and MARA session. |
+| `initializeConnection` | Client → Server | **Automated Setup:** Initializes the Bedrock stream, injects MARA context into the system prompt, and starts audio automatically. |
 | `emotionDetected` | Server → Client | Payload: `emotion`, `brain_region`, `technique`, `confidence`. |
 | `maraUpdate` | Server → Client | Payload: `dominantEmotion`, `emotionalArc`, `techniqueHistory`. |
 | `sessionSummary` | Server → Client | Sent on `stopAudio`, provides a full emotional review of the session. |
+
+### Streamlined Connection Flow
+The backend now features a fully automated WebSocket connection flow to eliminate client-side race conditions. When the client invokes `initializeConnection`, the server automatically orchestrates the complete setup sequence:
+1. **Stream Initialization**: Prepares bidirectional Bedrock streaming.
+2. **Context Injection**: Builds the MARA memory context and dynamically injects it into the system prompt.
+3. **Audio Startup**: Readies the server for audio transmission.
+This ensures a robust, sequential setup without requiring discrete `promptStart`, `systemPrompt`, or `audioStart` events from the client.
 
 ### REST Endpoints
 - **`POST /api/classify-emotion`**: Manually classify a transcript using Nova Lite.
