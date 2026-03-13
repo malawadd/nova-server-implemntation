@@ -69,7 +69,27 @@ export class StreamSession {
 
   async setupSystemPrompt(config?: Partial<SessionOptions>, systemPromptText?: string): Promise<void> {
     const text = systemPromptText || this.options.systemPrompt || "You are a helpful assistant.";
+    // 1. contentStart
     await this.sendEvent(this.buildSystemPromptEvent(text));
+    // 2. textInput (actual prompt text)
+    await this.sendEvent({
+      event: {
+        textInput: {
+          promptName: this.sessionId,
+          contentName: `${this.sessionId}-system`,
+          content: text,
+        }
+      }
+    });
+    // 3. contentEnd
+    await this.sendEvent({
+      event: {
+        contentEnd: {
+          promptName: this.sessionId,
+          contentName: `${this.sessionId}-system`,
+        }
+      }
+    });
   }
 
   async setupStartAudio(): Promise<void> {
@@ -152,7 +172,7 @@ export class StreamSession {
         }
       }
     };
-    // Note: actual text is sent as a separate textInput event — handled below
+    //actual text is sent as a separate textInput event handled below
   }
 
   private buildAudioStartEvent() {
@@ -358,7 +378,7 @@ export class NovaSonicBidirectionalStreamClient {
       const command = new InvokeModelWithBidirectionalStreamCommand({
         modelId,
         body: this.createAsyncIterable(sessionId, session),
-      } as unknown as InvokeModelWithBidirectionalStreamInput);
+      } as any);
 
       const response = await this.bedrockClient.send(command as any);
       this.activeStreams.set(sessionId, response);

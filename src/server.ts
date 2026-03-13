@@ -379,8 +379,25 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            await createNewSession(socket);
+            const session = await createNewSession(socket);
             bedrockClient.initiateBidirectionalStreaming(socket.id);
+            
+            // Stream hazır olana kadar bekle (100ms yeterli)
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            // Server tarafında sıralı setup — client event'i bekleme
+            await session.setupSessionAndPromptStart();
+            
+            const maraCtx = maraStore.buildMemoryContext(socket.id);
+            const fullPrompt = maraCtx
+                ? `${NeuroFeedbackSystemPrompt}\n\n${maraCtx}`
+                : NeuroFeedbackSystemPrompt;
+            await session.setupSystemPrompt(undefined, fullPrompt);
+            console.log(`[MARA] Memory injected into system prompt (${maraCtx.length} chars)`);
+            
+            await session.setupStartAudio();
+            console.log(`[Socket] Session fully initialized: ${socket.id}`);
+            
             sessionStates.set(socket.id, SessionState.ACTIVE);
             if (callback) callback({ success: true });
 
@@ -410,52 +427,11 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ── promptStart ───────────────────────────────────────────────────────────
-    socket.on('promptStart', async () => {
-        try {
-            const session = socketSessions.get(socket.id);
-            if (!session) { socket.emit('error', { message: 'No session for promptStart' }); return; }
-            await session.setupSessionAndPromptStart();
-            console.log(`[Socket] promptStart done: ${socket.id}`);
-        } catch (error) {
-            console.error('[Socket] promptStart error:', error);
-            socket.emit('error', { message: 'Error in promptStart', details: String(error) });
-        }
-    });
 
-    // ── systemPrompt: NeuroFeedback prompt + MARA memory inject ──────────────
-    socket.on('systemPrompt', async (_clientPrompt) => {
-        try {
-            const session = socketSessions.get(socket.id);
-            if (!session) { socket.emit('error', { message: 'No session for systemPrompt' }); return; }
 
-            const maraCtx = maraStore.buildMemoryContext(socket.id);
-            const fullPrompt = maraCtx
-                ? `${NeuroFeedbackSystemPrompt}\n\n${maraCtx}`
-                : NeuroFeedbackSystemPrompt;
 
-            await session.setupSystemPrompt(undefined, fullPrompt);
-            console.log(`[MARA] Memory injected into system prompt (${maraCtx.length} chars)`);
-        } catch (error) {
-            console.error('[Socket] systemPrompt error:', error);
-            socket.emit('error', { message: 'Error in systemPrompt', details: String(error) });
-        }
-    });
 
-    // ── audioStart ────────────────────────────────────────────────────────────
-    socket.on('audioStart', async (_data) => {
-        try {
-            const session = socketSessions.get(socket.id);
-            if (!session) { socket.emit('error', { message: 'No session for audioStart' }); return; }
-            await session.setupStartAudio();
-            console.log(`[Socket] audioStart done: ${socket.id}`);
-            socket.emit('audioReady');
-        } catch (error) {
-            console.error('[Socket] audioStart error:', error);
-            sessionStates.set(socket.id, SessionState.CLOSED);
-            socket.emit('error', { message: 'Error in audioStart', details: String(error) });
-        }
-    });
+
 
     // ── stopAudio ─────────────────────────────────────────────────────────────
     socket.on('stopAudio', async () => {
