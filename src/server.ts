@@ -4,11 +4,16 @@ import path from 'path';
 import { Server } from 'socket.io';
 import { fromIni } from "@aws-sdk/credential-providers";
 import { defaultProvider } from "@aws-sdk/credential-provider-node";
+import { BedrockRuntimeClient, InvokeModelCommand } from "@aws-sdk/client-bedrock-runtime";
 import { NovaSonicBidirectionalStreamClient, StreamSession } from './client';
 import { Buffer } from 'node:buffer';
+import { maraStore, EmotionSnapshot } from './mara';
+import { NeuroFeedbackSystemPrompt } from './consts';
 import dotenv from 'dotenv';
 
 dotenv.config();
+
+// ─── AWS Credentials ──────────────────────────────────────────────────────────
 
 function assertValidLongTermAwsCredentials(accessKeyId: string, secretAccessKey: string) {
     const normalizedAccessKeyId = accessKeyId.trim();
@@ -18,15 +23,10 @@ function assertValidLongTermAwsCredentials(accessKeyId: string, secretAccessKey:
     const looksLikeAwsSecret = normalizedSecretAccessKey.length === 40;
 
     if (!looksLikeLongTermIamAccessKey && !looksLikeTemporaryAccessKey) {
-        throw new Error(
-            `Invalid AWS_ACCESS_KEY_ID format. Expected an IAM access key like AKIA... or ASIA..., got prefix "${normalizedAccessKeyId.slice(0, 8)}...".`
-        );
+        throw new Error(`Invalid AWS_ACCESS_KEY_ID format. Got prefix "${normalizedAccessKeyId.slice(0, 8)}...".`);
     }
-
     if (!looksLikeAwsSecret) {
-        throw new Error(
-            `Invalid AWS_SECRET_ACCESS_KEY format. Expected a standard 40-character AWS secret access key, got length ${normalizedSecretAccessKey.length}.`
-        );
+        throw new Error(`Invalid AWS_SECRET_ACCESS_KEY format. Got length ${normalizedSecretAccessKey.length}.`);
     }
 }
 
@@ -38,41 +38,94 @@ function resolveAwsCredentials() {
 
     if (accessKeyId && secretAccessKey) {
         assertValidLongTermAwsCredentials(accessKeyId, secretAccessKey);
-
-        return {
-            accessKeyId,
-            secretAccessKey,
-            ...(sessionToken ? { sessionToken } : {}),
-        };
+        return { accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) };
     }
-
-    if (profile) {
-        return fromIni({ profile });
-    }
-
+    if (profile) return fromIni({ profile });
     return defaultProvider();
 }
 
-// Create Express app and HTTP server
+// ─── Nova Lite: Emotion Classifier ───────────────────────────────────────────
+//
+
+
+const bedrockLiteClient = new BedrockRuntimeClient({
+    region: process.env.AWS_REGION || "us-east-1",
+    credentials: resolveAwsCredentials() as any,
+});
+
+interface EmotionData {
+    emotion: 'anxiety' | 'stress' | 'sadness' | 'neutral';
+    brain_region: 'amygdala' | 'insula' | 'prefrontal_cortex' | 'none';
+    technique: 'box_breathing' | 'body_scan' | 'cognitive_reframe' | 'none';
+    confidence: number;
+}
+
+async function classifyEmotionWithNovaLite(utterance: string, sessionId: string): Promise<EmotionData> {
+    const mem = maraStore.getSession(sessionId);
+    const historyCtx = mem?.emotionHistory.length
+        ? `Session history (last 3): ${mem.emotionHistory.slice(-3).map(s => s.emotion).join(' → ')}.`
+        : 'First utterance in session.';
+
+    const prompt = `You are an emotion classifier for a neurofeedback application. Be precise.
+
+${historyCtx}
+User said: "${utterance}"
+
+Return ONLY valid JSON, no explanation, no markdown:
+{"emotion":"anxiety|stress|sadness|neutral","brain_region":"amygdala|insula|prefrontal_cortex|none","technique":"box_breathing|body_scan|cognitive_reframe|none","confidence":0.0}
+
+Mapping rules:
+- anxiety  → amygdala          → box_breathing
+- stress   → insula            → body_scan
+- sadness  → prefrontal_cortex → cognitive_reframe
+- neutral  → none              → none`;
+
+    try {
+        const cmd = new InvokeModelCommand({
+            modelId: "amazon.nova-lite-v1:0",
+            contentType: "application/json",
+            accept: "application/json",
+            body: JSON.stringify({
+                messages: [{ role: "user", content: [{ text: prompt }] }],
+                inferenceConfig: { maxTokens: 80, temperature: 0.05 }
+            })
+        });
+
+        const resp = await bedrockLiteClient.send(cmd);
+        const body = JSON.parse(new TextDecoder().decode(resp.body));
+        const text: string = body.output?.message?.content?.[0]?.text || '{}';
+        const match = text.match(/\{[\s\S]*?\}/);
+        if (match) {
+            const result = JSON.parse(match[0]) as EmotionData;
+            console.log(`[Nova Lite] "${utterance.slice(0, 45)}..." → ${result.emotion} (${Math.round(result.confidence * 100)}%)`);
+            return result;
+        }
+    } catch (e) {
+        console.error('[Nova Lite] Classification error:', e);
+    }
+
+    return { emotion: 'neutral', brain_region: 'none', technique: 'none', confidence: 0 };
+}
+
+// ─── App Setup ────────────────────────────────────────────────────────────────
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-// Create the AWS Bedrock client
+app.use(express.json());
+app.use(express.static(path.join(__dirname, '../public')));
+
 const bedrockClient = new NovaSonicBidirectionalStreamClient({
-    requestHandlerConfig: {
-        maxConcurrentStreams: 10,
-    },
+    requestHandlerConfig: { maxConcurrentStreams: 10 },
     clientConfig: {
         region: process.env.AWS_REGION || "us-east-1",
         credentials: resolveAwsCredentials()
     }
 });
 
-// Track active sessions per socket
 const socketSessions = new Map<string, StreamSession>();
 
-// Session states
 enum SessionState {
     INITIALIZING = 'initializing',
     READY = 'ready',
@@ -83,362 +136,365 @@ enum SessionState {
 const sessionStates = new Map<string, SessionState>();
 const cleanupInProgress = new Map<string, boolean>();
 
-// Periodically check for and close inactive sessions (every minute)
-// Sessions with no activity for over 5 minutes will be force closed
+// ─── Inactive Session Cleanup ─────────────────────────────────────────────────
+
 setInterval(() => {
-    console.log("Session cleanup check");
     const now = Date.now();
-
-    // Check all active sessions
     bedrockClient.getActiveSessions().forEach(sessionId => {
-        const lastActivity = bedrockClient.getLastActivityTime(sessionId);
-
-        // If no activity for 5 minutes, force close
-        if (now - lastActivity > 5 * 60 * 1000) {
-            console.log(`Closing inactive session ${sessionId} after 5 minutes of inactivity`);
-            try {
-                bedrockClient.forceCloseSession(sessionId);
-            } catch (error) {
-                console.error(`Error force closing inactive session ${sessionId}:`, error);
-            }
+        if (now - bedrockClient.getLastActivityTime(sessionId) > 5 * 60 * 1000) {
+            console.log(`[Cleanup] Closing inactive session ${sessionId}`);
+            try { bedrockClient.forceCloseSession(sessionId); } catch { }
         }
     });
 }, 60000);
 
-// Serve static files from the public directory
-app.use(express.static(path.join(__dirname, '../public')));
+// ─── REST ─────────────────────────────────────────────────────────────────────
 
-// Helper function to create and initialize a new session
-async function createNewSession(socket: any): Promise<StreamSession> {
-    const sessionId = socket.id;
+app.get('/health', (_req, res) => {
+    res.status(200).json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        activeSessions: bedrockClient.getActiveSessions().length,
+        socketConnections: Object.keys(io.sockets.sockets).length,
+    });
+});
 
+app.post('/api/classify-emotion', async (req: any, res: any) => {
     try {
-        console.log(`Creating new session for client: ${sessionId}`);
-        sessionStates.set(sessionId, SessionState.INITIALIZING);
+        const { transcript } = req.body;
+        const sessionId = req.body.sessionId || 'diagnostic-test';
 
-        // Create session with the correct API
-        const session = bedrockClient.createStreamSession(sessionId);
+        if (!transcript) {
+            return res.status(400).json({ error: 'Transcript is required' });
+        }
 
-        // Set up event handlers
-        setupSessionEventHandlers(session, socket);
+        console.log(`[Diagnostic] Manuel classification istendi: "${transcript.slice(0, 30)}..."`);
 
-        // Store the session (don't initiate AWS Bedrock connection yet)
-        socketSessions.set(sessionId, session);
-        sessionStates.set(sessionId, SessionState.READY);
-
-        console.log(`Session ${sessionId} created and ready, stored in maps`);
-        console.log(`Session map size: ${socketSessions.size}, States map size: ${sessionStates.size}`);
-        console.log(`Stored session for ${sessionId}:`, !!socketSessions.get(sessionId));
-
-        return session;
-    } catch (error) {
-        console.error(`Error creating session for ${sessionId}:`, error);
-        sessionStates.set(sessionId, SessionState.CLOSED);
-        throw error;
+        const result = await classifyEmotionWithNovaLite(transcript, sessionId);
+        res.json(result);
+    } catch (error: any) {
+        console.error('[API Error]', error);
+        res.status(500).json({ error: error.message });
     }
+});
+app.get('/api/mara/:sessionId', (req: any, res: any) => {
+    const mem = maraStore.getSession(req.params.sessionId);
+    if (!mem) return res.status(404).json({ error: 'Session not found' });
+    res.json(mem);
+});
+
+// ─── NeuroFeedback Tool Handler ───────────────────────────────────────────────
+
+
+function handleNeuroFeedbackTool(
+    toolName: string,
+    toolInput: any,
+    sessionId: string,
+    socket: any
+): object {
+    const tool = toolName.toLowerCase();
+    console.log(`[Tool ⚡] ${toolName}`, JSON.stringify(toolInput));
+
+    // ── triggerRegulationTechnique ────────────────────────────────────────────
+    if (tool === 'triggerregulationtechnique') {
+        const { technique, emotion, brain_region, intensity, rationale } = toolInput;
+
+        socket.emit('emotionDetected', {
+            emotion, brain_region, technique, intensity, confidence: 0.95
+        });
+        console.log(`[Tool] → emotionDetected emitted: ${emotion} / ${technique}`);
+
+        maraStore.addTechnique(sessionId, technique);
+        maraStore.addEmotionSnapshot(sessionId, {
+            timestamp: Date.now(),
+            emotion,
+            brain_region,
+            technique,
+            confidence: 0.95,
+            utterance: `[Nova Sonic triggered: ${rationale}]`,
+        });
+
+        return {
+            success: true,
+            activated: technique,
+            brain_region_highlighted: brain_region,
+            message: `${technique.replace(/_/g, ' ')} panel activated.`
+        };
+    }
+
+    // ── logEmotionalInsight ───────────────────────────────────────────────────
+    if (tool === 'logemotionalinsight') {
+        const { insight, shift_detected, current_emotion, previous_emotion } = toolInput;
+
+        if (shift_detected && current_emotion) {
+            socket.emit('emotionShift', {
+                from: previous_emotion || 'unknown',
+                to: current_emotion,
+                insight,
+            });
+            console.log(`[Tool] → emotionShift: ${previous_emotion} → ${current_emotion}`);
+        }
+
+        return { logged: true, insight };
+    }
+
+    console.warn(`[Tool] Unknown tool: ${toolName}`);
+    return { error: `Tool ${toolName} not recognized` };
 }
 
-// Helper function to set up event handlers for a session
+// ─── Session Event Handlers ───────────────────────────────────────────────────
+
 function setupSessionEventHandlers(session: StreamSession, socket: any) {
-
-
-    session.onEvent('usageEvent', (data) => {
-        console.log('usageEvent:', data);
-        socket.emit('usageEvent', data);
-    });
-
-    session.onEvent('completionStart', (data) => {
-        console.log('completionStart:', data);
-        socket.emit('completionStart', data);
-    });
+    const sessionId = socket.id;
 
     session.onEvent('contentStart', (data) => {
-        console.log('contentStart:', data);
         socket.emit('contentStart', data);
     });
 
-    session.onEvent('textOutput', (data) => {
-        console.log('Text output:', data);
+    // ── textOutput: her USER utterance → Nova Lite + MARA ────────────────────
+    session.onEvent('textOutput', async (data) => {
         socket.emit('textOutput', data);
+
+        if (data.role === 'USER' && data.content?.trim().length > 8) {
+            const utterance: string = data.content.trim();
+
+            // MARA transcript 
+            maraStore.addUtterance(sessionId, utterance);
+
+            // Nova Lite classification — non-blocking
+            classifyEmotionWithNovaLite(utterance, sessionId)
+                .then(emotionData => {
+                    if (emotionData.emotion !== 'neutral' && emotionData.confidence >= 0.45) {
+
+                        // MARA timeline
+                        const snapshot: EmotionSnapshot = {
+                            timestamp: Date.now(),
+                            emotion: emotionData.emotion,
+                            brain_region: emotionData.brain_region,
+                            technique: emotionData.technique,
+                            confidence: emotionData.confidence,
+                            utterance,
+                        };
+                        maraStore.addEmotionSnapshot(sessionId, snapshot);
+
+                        socket.emit('emotionDetected', emotionData);
+
+                        const mem = maraStore.getSession(sessionId);
+                        if (mem) {
+                            socket.emit('maraUpdate', {
+                                dominantEmotion: mem.dominantEmotion,
+                                emotionalArc: mem.emotionalArc,
+                                utteranceCount: mem.utteranceCount,
+                                techniqueHistory: mem.techniqueHistory,
+                                recentHistory: mem.emotionHistory.slice(-5).map(s => ({
+                                    emotion: s.emotion,
+                                    confidence: s.confidence,
+                                    timestamp: s.timestamp,
+                                })),
+                            });
+                        }
+                    }
+                })
+                .catch(e => console.error('[Nova Lite]', e));
+        }
     });
 
     session.onEvent('audioOutput', (data) => {
-        console.log('Audio output received, sending to client');
         socket.emit('audioOutput', data);
     });
 
     session.onEvent('error', (data) => {
-        console.error('Error in session:', data);
+        console.error('[Session error]', data);
         socket.emit('error', data);
     });
 
-    session.onEvent('toolUse', (data) => {
-        console.log('Tool use detected:', data.toolName);
-        socket.emit('toolUse', data);
-    });
-
-    session.onEvent('toolResult', (data) => {
-        console.log('Tool result received');
-        socket.emit('toolResult', data);
-    });
-
     session.onEvent('contentEnd', (data) => {
-        console.log('Content end received: ', data);
         socket.emit('contentEnd', data);
     });
 
     session.onEvent('streamComplete', () => {
-        console.log('Stream completed for client:', socket.id);
+        console.log(`[Session] Stream complete: ${sessionId}`);
         socket.emit('streamComplete');
-        sessionStates.set(socket.id, SessionState.CLOSED);
+        sessionStates.set(sessionId, SessionState.CLOSED);
     });
+
+    session.onEvent('toolEnd', async (data: any) => {
+        const { toolName, toolUseContent } = data;
+
+        let toolInput: any = {};
+        try {
+            if (toolUseContent?.content) {
+                toolInput = JSON.parse(toolUseContent.content);
+            }
+        } catch {
+            console.error('[Tool] Failed to parse tool input');
+        }
+
+        handleNeuroFeedbackTool(toolName, toolInput, sessionId, socket);
+    });
+
+    session.onEvent('usageEvent', (_data) => { /* intentionally silent */ });
 }
 
-// Socket.IO connection handler
-io.on('connection', (socket) => {
-    console.log('New client connected:', socket.id);
+// ─── Session Lifecycle ────────────────────────────────────────────────────────
 
-    // Don't create session immediately - wait for client to request it
+async function createNewSession(socket: any): Promise<StreamSession> {
+    const sessionId = socket.id;
+    console.log(`[Session] Creating: ${sessionId}`);
+    sessionStates.set(sessionId, SessionState.INITIALIZING);
+
+    const session = bedrockClient.createStreamSession(sessionId);
+    setupSessionEventHandlers(session, socket);
+
+    // MARA memory başlat
+    maraStore.createSession(sessionId);
+    console.log(`[MARA] Memory initialized for ${sessionId}`);
+
+    socketSessions.set(sessionId, session);
+    sessionStates.set(sessionId, SessionState.READY);
+    return session;
+}
+
+// ─── Socket.IO ────────────────────────────────────────────────────────────────
+
+io.on('connection', (socket) => {
+    console.log(`[Socket] Connected: ${socket.id}`);
     sessionStates.set(socket.id, SessionState.CLOSED);
 
-    // Connection count logging (only set up once per connection)
     const connectionInterval = setInterval(() => {
-        const connectionCount = Object.keys(io.sockets.sockets).length;
-        console.log(`Active socket connections: ${connectionCount}`);
+        const count = Object.keys(io.sockets.sockets).length;
+        console.log(`Active socket connections: ${count}`);
     }, 60000);
 
-    // Handle session initialization request
+    // ── initializeConnection ──────────────────────────────────────────────────
     socket.on('initializeConnection', async (callback) => {
         try {
             const currentState = sessionStates.get(socket.id);
-            console.log(`Initializing session for ${socket.id}, current state: ${currentState}`);
-            if (currentState === SessionState.INITIALIZING || currentState === SessionState.READY || currentState === SessionState.ACTIVE) {
-                console.log(`Session already exists for ${socket.id}, state: ${currentState}`);
+            console.log(`[Socket] initializeConnection for ${socket.id}, state: ${currentState}`);
+
+            if (currentState === SessionState.INITIALIZING ||
+                currentState === SessionState.READY ||
+                currentState === SessionState.ACTIVE) {
                 if (callback) callback({ success: true });
                 return;
             }
 
-            await createNewSession(socket);
-
-            // Start the AWS Bedrock connection
-            console.log(`Starting AWS Bedrock connection for ${socket.id}`);
+            const session = await createNewSession(socket);
             bedrockClient.initiateBidirectionalStreaming(socket.id);
-
-            // Update state to active
+            
+            // Stream hazır olana kadar bekle (100ms yeterli)
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            // Server tarafında sıralı setup — client event'i bekleme
+            await session.setupSessionAndPromptStart();
+            
+            const maraCtx = maraStore.buildMemoryContext(socket.id);
+            const fullPrompt = maraCtx
+                ? `${NeuroFeedbackSystemPrompt}\n\n${maraCtx}`
+                : NeuroFeedbackSystemPrompt;
+            await session.setupSystemPrompt(undefined, fullPrompt);
+            console.log(`[MARA] Memory injected into system prompt (${maraCtx.length} chars)`);
+            
+            await session.setupStartAudio();
+            console.log(`[Socket] Session fully initialized: ${socket.id}`);
+            
             sessionStates.set(socket.id, SessionState.ACTIVE);
-
             if (callback) callback({ success: true });
 
         } catch (error) {
-            console.error('Error initializing session:', error);
+            console.error('[Socket] initializeConnection error:', error);
             sessionStates.set(socket.id, SessionState.CLOSED);
-            if (callback) callback({ success: false, error: error instanceof Error ? error.message : String(error) });
-            socket.emit('error', {
-                message: 'Failed to initialize session',
-                details: error instanceof Error ? error.message : String(error)
+            if (callback) callback({
+                success: false,
+                error: error instanceof Error ? error.message : String(error)
             });
         }
     });
 
-    // Handle starting a new chat (after stopping previous one)
-    socket.on('startNewChat', async () => {
-        try {
-            const currentState = sessionStates.get(socket.id);
-            console.log(`Starting new chat for ${socket.id}, current state: ${currentState}`);
-
-            // Clean up existing session if any
-            const existingSession = socketSessions.get(socket.id);
-            if (existingSession && bedrockClient.isSessionActive(socket.id)) {
-                console.log(`Cleaning up existing session for ${socket.id}`);
-                try {
-                    await existingSession.endAudioContent();
-                    await existingSession.endPrompt();
-                    await existingSession.close();
-                } catch (cleanupError) {
-                    console.error(`Error during cleanup for ${socket.id}:`, cleanupError);
-                    bedrockClient.forceCloseSession(socket.id);
-                }
-                socketSessions.delete(socket.id);
-            }
-
-            // Create new session
-            await createNewSession(socket);
-        } catch (error) {
-            console.error('Error starting new chat:', error);
-            socket.emit('error', {
-                message: 'Failed to start new chat',
-                details: error instanceof Error ? error.message : String(error)
-            });
-        }
-    });
-
-    // Audio input handler with session validation
+    // ── audioInput ────────────────────────────────────────────────────────────
     socket.on('audioInput', async (audioData) => {
         try {
             const session = socketSessions.get(socket.id);
             const currentState = sessionStates.get(socket.id);
+            if (!session || currentState !== SessionState.ACTIVE) return;
 
-            // console.log(`Audio input received for ${socket.id}, session exists: ${!!session}, state: ${currentState}`);
-
-            if (!session || currentState !== SessionState.ACTIVE) {
-                console.error(`Invalid session state for audio input: session=${!!session}, state=${currentState}`);
-                socket.emit('error', {
-                    message: 'No active session for audio input',
-                    details: `Session exists: ${!!session}, Session state: ${currentState}. Session must be ACTIVE to receive audio.`
-                });
-                return;
-            }
-
-            // Convert base64 string to Buffer
             const audioBuffer = typeof audioData === 'string'
                 ? Buffer.from(audioData, 'base64')
                 : Buffer.from(audioData);
-
-            // Stream the audio
             await session.streamAudio(audioBuffer);
-
         } catch (error) {
-            console.error('Error processing audio:', error);
-            socket.emit('error', {
-                message: 'Error processing audio',
-                details: error instanceof Error ? error.message : String(error)
-            });
+            console.error('[Socket] audioInput error:', error);
         }
     });
 
-    socket.on('promptStart', async () => {
-        try {
-            const session = socketSessions.get(socket.id);
-            const currentState = sessionStates.get(socket.id);
-            console.log(`Prompt start received for ${socket.id}, session exists: ${!!session}, state: ${currentState}`);
 
-            if (!session) {
-                console.error(`No session found for promptStart: ${socket.id}`);
-                socket.emit('error', { message: 'No active session for prompt start' });
-                return;
-            }
 
-            await session.setupSessionAndPromptStart();
-            console.log(`Prompt start completed for ${socket.id}`);
-        } catch (error) {
-            console.error('Error processing prompt start:', error);
-            socket.emit('error', {
-                message: 'Error processing prompt start',
-                details: error instanceof Error ? error.message : String(error)
-            });
-        }
-    });
 
-    socket.on('systemPrompt', async (data) => {
-        try {
-            const session = socketSessions.get(socket.id);
-            const currentState = sessionStates.get(socket.id);
-            console.log(`System prompt received for ${socket.id}, session exists: ${!!session}, state: ${currentState}`);
 
-            if (!session) {
-                console.error(`No session found for systemPrompt: ${socket.id}`);
-                socket.emit('error', { message: 'No active session for system prompt' });
-                return;
-            }
 
-            await session.setupSystemPrompt(undefined, data);
-            console.log(`System prompt completed for ${socket.id}`);
-        } catch (error) {
-            console.error('Error processing system prompt:', error);
-            socket.emit('error', {
-                message: 'Error processing system prompt',
-                details: error instanceof Error ? error.message : String(error)
-            });
-        }
-    });
 
-    socket.on('audioStart', async (data) => {
-        try {
-            const session = socketSessions.get(socket.id);
-            const currentState = sessionStates.get(socket.id);
-            console.log(`Audio start received for ${socket.id}, session exists: ${!!session}, state: ${currentState}`);
-
-            if (!session) {
-                console.error(`No session found for audioStart: ${socket.id}`);
-                socket.emit('error', { message: 'No active session for audio start' });
-                return;
-            }
-
-            // Set up audio configuration
-            await session.setupStartAudio();
-            console.log(`Audio start setup completed for ${socket.id}`);
-
-            // Emit confirmation that session is fully ready for audio
-            socket.emit('audioReady');
-        } catch (error) {
-            console.error('Error processing audio start:', error);
-            sessionStates.set(socket.id, SessionState.CLOSED);
-            socket.emit('error', {
-                message: 'Error processing audio start',
-                details: error instanceof Error ? error.message : String(error)
-            });
-        }
-    });
-
+    // ── stopAudio ─────────────────────────────────────────────────────────────
     socket.on('stopAudio', async () => {
         try {
             const session = socketSessions.get(socket.id);
             if (!session || cleanupInProgress.get(socket.id)) {
-                console.log('No active session to stop or cleanup already in progress');
+                console.log('[Socket] stopAudio: no session or cleanup in progress');
                 return;
             }
 
-            console.log('Stop audio requested, beginning proper shutdown sequence');
+            console.log(`[Socket] Stop audio: ${socket.id}`);
             cleanupInProgress.set(socket.id, true);
             sessionStates.set(socket.id, SessionState.CLOSED);
 
-            // Chain the closing sequence with timeout protection
-            const cleanupPromise = Promise.race([
+            const mem = maraStore.getSession(socket.id);
+            if (mem) {
+                socket.emit('sessionSummary', {
+                    durationSeconds: Math.round((Date.now() - mem.startedAt) / 1000),
+                    utteranceCount: mem.utteranceCount,
+                    dominantEmotion: mem.dominantEmotion,
+                    emotionalArc: mem.emotionalArc,
+                    techniquesUsed: mem.techniqueHistory,
+                    emotionTimeline: mem.emotionHistory.map(s => ({
+                        emotion: s.emotion,
+                        confidence: s.confidence,
+                        msFromStart: s.timestamp - mem.startedAt,
+                    })),
+                });
+            }
+
+            await Promise.race([
                 (async () => {
                     await session.endAudioContent();
                     await session.endPrompt();
                     await session.close();
-                    console.log('Session cleanup complete');
+                    console.log('[Socket] Session cleanup complete');
                 })(),
-                new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error('Session cleanup timeout')), 5000)
-                )
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Cleanup timeout')), 5000))
             ]);
 
-            await cleanupPromise;
-
-            // Remove from tracking
             socketSessions.delete(socket.id);
             cleanupInProgress.delete(socket.id);
-
-            // Notify client that session is closed and ready for new chat
+            maraStore.deleteSession(socket.id);
             socket.emit('sessionClosed');
 
         } catch (error) {
-            console.error('Error processing streaming end events:', error);
-
-            // Force cleanup on error
+            console.error('[Socket] stopAudio error:', error);
             try {
                 bedrockClient.forceCloseSession(socket.id);
                 socketSessions.delete(socket.id);
                 cleanupInProgress.delete(socket.id);
+                maraStore.deleteSession(socket.id);
                 sessionStates.set(socket.id, SessionState.CLOSED);
-            } catch (forceError) {
-                console.error('Error during force cleanup:', forceError);
+            } catch (fe) {
+                console.error('[Socket] Force cleanup error:', fe);
             }
-
-            socket.emit('error', {
-                message: 'Error processing streaming end events',
-                details: error instanceof Error ? error.message : String(error)
-            });
+            socket.emit('error', { message: 'Error stopping session', details: String(error) });
         }
     });
 
-    // Handle disconnection
+    // ── disconnect ────────────────────────────────────────────────────────────
     socket.on('disconnect', async () => {
-        console.log('Client disconnected abruptly:', socket.id);
-
-        // Clear the connection interval
+        console.log(`[Socket] Disconnected: ${socket.id}`);
         clearInterval(connectionInterval);
 
         const session = socketSessions.get(socket.id);
@@ -446,97 +502,55 @@ io.on('connection', (socket) => {
 
         if (session && bedrockClient.isSessionActive(sessionId) && !cleanupInProgress.get(socket.id)) {
             try {
-                console.log(`Beginning cleanup for abruptly disconnected session: ${socket.id}`);
+                console.log(`[Socket] Cleaning up abrupt disconnect: ${sessionId}`);
                 cleanupInProgress.set(socket.id, true);
-
-                // Add explicit timeouts to avoid hanging promises
-                const cleanupPromise = Promise.race([
+                await Promise.race([
                     (async () => {
                         await session.endAudioContent();
                         await session.endPrompt();
                         await session.close();
                     })(),
-                    new Promise((_, reject) =>
-                        setTimeout(() => reject(new Error('Session cleanup timeout')), 3000)
-                    )
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('Cleanup timeout')), 3000))
                 ]);
-
-                await cleanupPromise;
-                console.log(`Successfully cleaned up session after abrupt disconnect: ${socket.id}`);
             } catch (error) {
-                console.error(`Error cleaning up session after disconnect: ${socket.id}`, error);
-                try {
-                    bedrockClient.forceCloseSession(sessionId);
-                    console.log(`Force closed session: ${sessionId}`);
-                } catch (e) {
-                    console.error(`Failed even force close for session: ${sessionId}`, e);
-                }
+                console.error(`[Socket] Cleanup error after disconnect:`, error);
+                try { bedrockClient.forceCloseSession(sessionId); } catch { }
             }
         }
 
-        // Clean up tracking maps
         socketSessions.delete(socket.id);
         sessionStates.delete(socket.id);
         cleanupInProgress.delete(socket.id);
-
-        console.log(`Cleanup complete for disconnected client: ${socket.id}`);
+        maraStore.deleteSession(socket.id);
+        console.log(`[Socket] Cleanup complete: ${socket.id}`);
     });
 });
 
-// Health check endpoint
-app.get('/health', (_req, res) => {
-    const activeSessions = bedrockClient.getActiveSessions().length;
-    const socketConnections = Object.keys(io.sockets.sockets).length;
+// ─── Start Server ─────────────────────────────────────────────────────────────
 
-    res.status(200).json({
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        activeSessions,
-        socketConnections
-    });
-});
-
-// Start the server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
-    console.log(`Open http://localhost:${PORT} in your browser to access the application`);
+    console.log(`\n🧠  NeuroFeedback Lite  ·  MARA-powered backend`);
+    console.log(`    http://localhost:${PORT}`);
+    console.log(`    Nova Sonic : amazon.nova-2-sonic-v1:0`);
+    console.log(`    Nova Lite  : amazon.nova-lite-v1:0\n`);
 });
 
 process.on('SIGINT', async () => {
-    console.log('Shutting down server...');
-
-    const forceExitTimer = setTimeout(() => {
-        console.error('Forcing server shutdown after timeout');
-        process.exit(1);
-    }, 5000);
-
+    console.log('[Server] Shutting down...');
+    const forceExitTimer = setTimeout(() => process.exit(1), 5000);
     try {
-        // First close Socket.IO server which manages WebSocket connections
         await new Promise(resolve => io.close(resolve));
-        console.log('Socket.IO server closed');
-
-        // Then close all active sessions
         const activeSessions = bedrockClient.getActiveSessions();
-        console.log(`Closing ${activeSessions.length} active sessions...`);
-
         await Promise.all(activeSessions.map(async (sessionId) => {
-            try {
-                await bedrockClient.closeSession(sessionId);
-                console.log(`Closed session ${sessionId} during shutdown`);
-            } catch (error) {
-                console.error(`Error closing session ${sessionId} during shutdown:`, error);
-                bedrockClient.forceCloseSession(sessionId);
-            }
+            try { await bedrockClient.closeSession(sessionId); }
+            catch { bedrockClient.forceCloseSession(sessionId); }
         }));
-
-        // Now close the HTTP server with a promise
         await new Promise(resolve => server.close(resolve));
         clearTimeout(forceExitTimer);
-        console.log('Server shut down');
         process.exit(0);
     } catch (error) {
-        console.error('Error during server shutdown:', error);
+        console.error('[Server] Shutdown error:', error);
         process.exit(1);
     }
 });

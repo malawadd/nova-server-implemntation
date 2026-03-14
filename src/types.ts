@@ -4,6 +4,22 @@ export interface InferenceConfig {
   readonly temperature: number;
 }
 
+
+export interface SessionConfig {
+  sessionId: string;
+  modelId: string;
+  inferenceConfig: InferenceConfig;
+  systemPrompt?: string;
+}
+
+export interface EmotionData {
+  emotion: string;
+  confidence: number;
+  brain_region: string;
+  technique: string;
+  timestamp: string;
+}
+
 export type ContentType = "AUDIO" | "TEXT" | "TOOL";
 export type AudioType = "SPEECH";
 export type AudioMediaType = "audio/lpcm"
