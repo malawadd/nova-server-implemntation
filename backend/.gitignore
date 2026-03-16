@@ -1,0 +1,21 @@
+# IDE files
+.idea/
+
+# Build output
+out/
+
+# Logs
+logs/
+
+# Node modules (if applicable for TypeScript project)
+node_modules/
+
+# Build artifacts
+dist/
+
+output/*
+
+# Local environment files
+.env
+.env.*
+!.env.example
